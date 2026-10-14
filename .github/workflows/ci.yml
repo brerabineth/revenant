@@ -18,6 +18,13 @@ jobs:
         run: bash test/unit_test.sh
       - name: e2e
         run: bash test/e2e_local.sh
+      - name: upload host scan for calibration
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-scan
+          path: /tmp/rvt-e2e.*/host.json
+          if-no-files-found: ignore
 
   macos-bash-3-2:
     runs-on: macos-latest

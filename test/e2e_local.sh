@@ -98,8 +98,15 @@ RVT_NO_COLOR=1 "$BIN" scan --json > "$WT/host.json"; HC=$?
 case $HC in 0|1|2|3|10) ok "host scan exit=$HC (in domain)" ;; *) bad "host scan exit=$HC" ;; esac
 python3 -m json.tool < "$WT/host.json" > /dev/null 2>&1 && ok "host json valid" || bad "host json valid"
 
-echo "[13] output hygiene (no host paths in any artifact)"
-if grep -rq "$HOME" "$WT" 2>/dev/null; then bad "no home paths in outputs"; else ok "no home paths in outputs"; fi
+echo "[13] output hygiene (fixture artifacts carry no home paths)"
+# host.json legitimately names paths of the machine under test; fixtures must not
+if grep -l "$HOME" "$WT/scan-dirty.txt" "$WT/scan-clean.txt" "$WT/dirty.json" "$WT/dirty.md" \
+     "$WT/out/report.json" "$WT/out/report.md" "$WT/base.txt" "$WT/chk1.txt" "$WT/chk2.txt" \
+     "$WT/ex.txt" "$WT/d2" -r 2>/dev/null | grep -q .; then
+  bad "fixture artifacts clean of home paths"
+else
+  ok "fixture artifacts clean of home paths"
+fi
 
 echo
 echo "e2e: $PASS passed, $FAIL failed"
