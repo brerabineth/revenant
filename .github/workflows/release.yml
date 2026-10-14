@@ -1,0 +1,33 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify before shipping
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck bin/revenant
+          bash test/unit_test.sh
+          bash test/e2e_local.sh
+      - name: package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p "revenant-${VERSION}"
+          cp bin/revenant "revenant-${VERSION}/"
+          cp README.md LICENSE "revenant-${VERSION}/"
+          tar -czf "revenant-${VERSION}.tar.gz" "revenant-${VERSION}"
+          sha256sum "revenant-${VERSION}.tar.gz" > SHA256SUMS
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            revenant-*.tar.gz
+            SHA256SUMS
