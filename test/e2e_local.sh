@@ -97,6 +97,19 @@ echo "[12] host scan (read-only)"
 RVT_NO_COLOR=1 "$BIN" scan --json > "$WT/host.json"; HC=$?
 case $HC in 0|1|2|3|10) ok "host scan exit=$HC (in domain)" ;; *) bad "host scan exit=$HC" ;; esac
 python3 -m json.tool < "$WT/host.json" > /dev/null 2>&1 && ok "host json valid" || bad "host json valid"
+cp "$WT/host.json" /tmp/revenant-host-scan.json 2>/dev/null || true
+# surface what the running machine looks like to the tool (visible in CI logs)
+python3 - <<'PYEOF' || true
+import json
+try:
+    d = json.load(open("/tmp/revenant-host-scan.json"))
+    print("host verdict:", d["verdict"], "score:", d["score"])
+    for f in d["findings"]:
+        if f["severity"] in ("crit", "high"):
+            print(" ", f["severity"], f["id"], f["path"])
+except Exception:
+    pass
+PYEOF
 
 echo "[13] output hygiene (fixture artifacts carry no home paths)"
 # host.json legitimately names paths of the machine under test; fixtures must not
